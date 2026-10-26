@@ -73,9 +73,57 @@ function KaaliRaaniGame() {
           }
 
           // Immediately restore ongoing game screen so user never sees the landing page or rejoin button
-          if (cachedState) {
-            setRoomState(cachedState);
+          if (!cachedState) {
+            cachedState = {
+              roomCode: parsed.roomCode,
+              phase: 'lobby',
+              currentRound: 0,
+              totalRounds: 3,
+              totalTricks: 0,
+              players: [
+                {
+                  id: `pending-${parsed.roomCode}-${parsed.username}`,
+                  username: parsed.username,
+                  isHost: parsed.isHost,
+                  isBot: false,
+                  isReady: false,
+                  isConnected: true,
+                  hand: [],
+                  seatIndex: 0,
+                  hasPassedBid: false,
+                  currentBid: 0,
+                  tricksWon: 0,
+                  cardPointsCollected: 0,
+                  matchScore: 0,
+                },
+              ],
+              settings: {
+                totalRounds: 3,
+                minBid: 70,
+                bidIncrement: 5,
+                maxBid: 150,
+                autoFillBots: true,
+                maxPlayers: 6,
+              },
+              highestBid: 0,
+              isPartnerRevealed: false,
+              currentTrick: { trickNumber: 1, leadPlayerId: '', cards: [] },
+              completedTricks: [],
+              roundResults: [],
+              actionLogs: [
+                {
+                  id: `log-${Date.now()}`,
+                  timestamp: Date.now(),
+                  text: `Rejoined room ${parsed.roomCode}. Connecting...`,
+                  type: 'system',
+                },
+              ],
+              lastActiveAt: Date.now(),
+              updatedAt: Date.now(),
+            };
           }
+
+          setRoomState(cachedState);
 
           // Auto-reconnect to room in the background
           const mgr = initManager();
@@ -164,24 +212,77 @@ function KaaliRaaniGame() {
 
   const handleJoinRoom = async (roomCode: string, username: string) => {
     setPeerStatus('connecting');
-    setStatusMessage('');
+    setStatusMessage('Connecting to room...');
 
     const cleanCode = roomCode.toUpperCase().trim();
     const session: SavedSession = { roomCode: cleanCode, username, isHost: false };
     localStorage.setItem('kaali_raani_session', JSON.stringify(session));
 
-    // If cached state exists for this room, restore it immediately
+    // Restore cached state if available, or create a provisional room state so user enters room immediately
+    let initialJoinedState: RoomState | null = null;
     if (typeof window !== 'undefined') {
       try {
         const cached = localStorage.getItem(`kr_state_${cleanCode}`);
         if (cached) {
           const parsed = JSON.parse(cached);
           if (parsed && (!parsed.lastActiveAt || Date.now() - parsed.lastActiveAt <= ROOM_INACTIVITY_TIMEOUT_MS)) {
-            setRoomState(parsed);
+            initialJoinedState = parsed;
           }
         }
       } catch {}
     }
+
+    if (!initialJoinedState) {
+      initialJoinedState = {
+        roomCode: cleanCode,
+        phase: 'lobby',
+        currentRound: 0,
+        totalRounds: 3,
+        totalTricks: 0,
+        players: [
+          {
+            id: `pending-${cleanCode}-${username}`,
+            username: username,
+            isHost: false,
+            isBot: false,
+            isReady: false,
+            isConnected: true,
+            hand: [],
+            seatIndex: 0,
+            hasPassedBid: false,
+            currentBid: 0,
+            tricksWon: 0,
+            cardPointsCollected: 0,
+            matchScore: 0,
+          },
+        ],
+        settings: {
+          totalRounds: 3,
+          minBid: 70,
+          bidIncrement: 5,
+          maxBid: 150,
+          autoFillBots: true,
+          maxPlayers: 6,
+        },
+        highestBid: 0,
+        isPartnerRevealed: false,
+        currentTrick: { trickNumber: 1, leadPlayerId: '', cards: [] },
+        completedTricks: [],
+        roundResults: [],
+        actionLogs: [
+          {
+            id: `log-${Date.now()}`,
+            timestamp: Date.now(),
+            text: `${username} joined room ${cleanCode}. Waiting for host...`,
+            type: 'system',
+          },
+        ],
+        lastActiveAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+    }
+
+    setRoomState(initialJoinedState);
 
     const mgr = initManager();
     await mgr.initClient(cleanCode, username);
@@ -287,8 +388,16 @@ function KaaliRaaniGame() {
 
       {/* Main Game Screen */}
       <main className="relative z-10 flex-1 flex flex-col items-center justify-center p-2 sm:p-4 w-full">
-        {/* Connection message notification if error */}
-        {peerStatus === 'error' && (
+        {/* Waiting for host banner when inside a room */}
+        {roomState && peerStatus !== 'connected' && (
+          <div className="w-full max-w-lg mb-3 px-4 py-2 bg-amber-950/80 border border-amber-600/60 rounded-xl text-amber-200 text-xs text-center font-mono flex items-center justify-center gap-2 shadow-lg backdrop-blur-md animate-in fade-in">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping inline-block" />
+            <span>{statusMessage || 'Host is offline or away. Waiting for host to reconnect...'}</span>
+          </div>
+        )}
+
+        {/* Error notification on landing page */}
+        {!roomState && peerStatus === 'error' && (
           <div className="w-full max-w-lg mb-4 p-3 bg-rose-950/80 border border-rose-700 rounded-xl text-rose-300 text-xs text-center font-mono">
             {statusMessage || 'Network connection issue. Please check room code and try again.'}
           </div>

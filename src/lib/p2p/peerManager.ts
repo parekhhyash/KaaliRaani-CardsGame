@@ -66,6 +66,7 @@ export class PeerGameManager {
   private botTimer: NodeJS.Timeout | null = null;
   private inactivityInterval: NodeJS.Timeout | null = null;
   private heartbeatInterval: NodeJS.Timeout | null = null;
+  private clientReconnectTimer: NodeJS.Timeout | null = null;
   private trickTransitionTimer: NodeJS.Timeout | null = null;
   private revealTimer: NodeJS.Timeout | null = null;
   private unloadHandler: (() => void) | null = null;
@@ -253,8 +254,8 @@ export class PeerGameManager {
         this.peer.on('error', (err: any) => {
           console.warn('Peer host error:', err);
           if (err.type === 'unavailable-id') {
-            if (retryCount < 3 && !this.isDestroyed) {
-              this.notifyStatus('connecting', `Host session clearing, reconnecting (attempt ${retryCount + 1}/3)...`);
+            if (retryCount < 8 && !this.isDestroyed) {
+              this.notifyStatus('connecting', `Host session clearing, reconnecting (attempt ${retryCount + 1}/8)...`);
               setTimeout(async () => {
                 try {
                   if (this.peer && !this.peer.destroyed) {
@@ -295,109 +296,143 @@ export class PeerGameManager {
     const clientPeerId = `kr-${this.roomCode}-${cleanName}-${Math.random().toString(36).substring(2, 6)}`;
     this.myPeerId = clientPeerId;
 
-    return new Promise((resolve, reject) => {
+    const hostPeerId = `kr-${this.roomCode}-host`;
+
+    return new Promise((resolve) => {
       try {
         this.peer = new Peer(clientPeerId, PEER_CONFIG);
 
         this.peer.on('open', () => {
-          const hostPeerId = `kr-${this.roomCode}-host`;
-          this.connectToHost(hostPeerId, resolve, reject);
+          this.connectToHost(hostPeerId);
+          resolve();
         });
 
         this.peer.on('error', (err: any) => {
-          console.warn('Client peer error:', err);
+          console.warn('Client peer event:', err);
+          if (err.type === 'peer-unavailable') {
+            // Host is offline/disconnected. Keep waiting and retrying peacefully without showing a fatal error
+            this.notifyStatus('connecting', 'Host is offline or away. Waiting for host to reconnect...');
+            this.scheduleClientReconnect(hostPeerId);
+            resolve();
+            return;
+          }
+          if (
+            err.type === 'network' ||
+            err.type === 'server-error' ||
+            err.type === 'socket-error' ||
+            err.type === 'socket-closed'
+          ) {
+            this.notifyStatus('connecting', 'Reconnecting to network...');
+            this.scheduleClientReconnect(hostPeerId);
+            resolve();
+            return;
+          }
           this.notifyStatus('error', err.message || 'Client connection error');
+          resolve();
         });
       } catch (err: any) {
         this.notifyStatus('error', err.message || 'Failed to initialize Peer');
-        reject(err);
+        resolve();
       }
     });
   }
 
-  private connectToHost(hostPeerId: string, resolve: () => void, reject: (err: any) => void, retryCount = 0) {
-    if (this.isDestroyed) return;
+  private connectToHost(hostPeerId: string) {
+    if (this.isDestroyed || this.isHost) return;
+    if (!this.peer || this.peer.destroyed) return;
 
-    const conn = this.peer.connect(hostPeerId, {
-      reliable: true,
-    });
+    if (this.hostConnection) {
+      try {
+        this.hostConnection.close();
+      } catch {}
+      this.hostConnection = null;
+    }
 
-    this.hostConnection = conn;
-    let hasReceivedState = false;
+    try {
+      const conn = this.peer.connect(hostPeerId, {
+        reliable: true,
+      });
 
-    conn.on('open', () => {
-      this.notifyStatus('connected', 'Connected to room host');
-      this.startHeartbeat();
+      this.hostConnection = conn;
+      let hasReceivedState = false;
 
-      const sendJoin = () => {
-        if (hasReceivedState || !this.hostConnection || !this.hostConnection.open) return;
-        const msg: P2PMessage = {
-          type: 'JOIN_REQUEST',
-          username: this.username,
-          playerId: this.myPeerId,
-          isHost: false,
+      conn.on('open', () => {
+        if (this.clientReconnectTimer) {
+          clearTimeout(this.clientReconnectTimer);
+          this.clientReconnectTimer = null;
+        }
+        this.notifyStatus('connected', 'Connected to room host');
+        this.startHeartbeat();
+
+        const sendJoin = () => {
+          if (hasReceivedState || !this.hostConnection || !this.hostConnection.open) return;
+          const msg: P2PMessage = {
+            type: 'JOIN_REQUEST',
+            username: this.username,
+            playerId: this.myPeerId,
+            isHost: false,
+          };
+          try {
+            this.hostConnection.send(msg);
+          } catch (e) {
+            console.warn('Failed to send JOIN_REQUEST:', e);
+          }
         };
-        try {
-          this.hostConnection.send(msg);
-        } catch (e) {
-          console.warn('Failed to send JOIN_REQUEST:', e);
+
+        // Send initial JOIN_REQUEST with small delay to let host SCTP stream settle
+        setTimeout(sendJoin, 60);
+
+        // If no SYNC_STATE is received within 750ms, retry sending JOIN_REQUEST up to 4 times
+        let joinRetries = 0;
+        const joinInterval = setInterval(() => {
+          if (hasReceivedState || this.isDestroyed || !this.hostConnection?.open) {
+            clearInterval(joinInterval);
+            return;
+          }
+          joinRetries++;
+          if (joinRetries > 4) {
+            clearInterval(joinInterval);
+            return;
+          }
+          sendJoin();
+        }, 750);
+      });
+
+      conn.on('data', (data: any) => {
+        if (data && data.type === 'SYNC_STATE') {
+          hasReceivedState = true;
         }
-      };
+        this.handleClientReceivedData(data);
+      });
 
-      // Send initial JOIN_REQUEST with small delay to let host SCTP stream settle
-      setTimeout(sendJoin, 60);
+      conn.on('close', () => {
+        this.notifyStatus('connecting', 'Host is offline or away. Waiting for host to reconnect...');
+        this.scheduleClientReconnect(hostPeerId);
+      });
 
-      // If no SYNC_STATE is received within 750ms, retry sending JOIN_REQUEST up to 4 times
-      let joinRetries = 0;
-      const joinInterval = setInterval(() => {
-        if (hasReceivedState || this.isDestroyed || !this.hostConnection?.open) {
-          clearInterval(joinInterval);
-          return;
-        }
-        joinRetries++;
-        if (joinRetries > 4) {
-          clearInterval(joinInterval);
-          return;
-        }
-        sendJoin();
-      }, 750);
-
-      resolve();
-    });
-
-    conn.on('data', (data: any) => {
-      if (data && data.type === 'SYNC_STATE') {
-        hasReceivedState = true;
-      }
-      this.handleClientReceivedData(data);
-    });
-
-    conn.on('close', () => {
-      this.notifyStatus('disconnected', 'Host disconnected. Attempting to reconnect...');
-      this.attemptClientReconnect(hostPeerId);
-    });
-
-    conn.on('error', (err: any) => {
-      console.warn('Host connection error:', err);
-      if (retryCount < 3 && !this.isDestroyed) {
-        this.notifyStatus('connecting', `Connecting to host (attempt ${retryCount + 2}/4)...`);
-        setTimeout(() => {
-          this.connectToHost(hostPeerId, resolve, reject, retryCount + 1);
-        }, 1200 * (retryCount + 1));
-      } else {
-        this.notifyStatus('error', 'Could not connect to host. Please verify the room code and try again.');
-        reject(err);
-      }
-    });
+      conn.on('error', (err: any) => {
+        console.warn('Host connection error:', err);
+        this.notifyStatus('connecting', 'Host is offline or away. Waiting for host to reconnect...');
+        this.scheduleClientReconnect(hostPeerId);
+      });
+    } catch (err: any) {
+      console.warn('connectToHost error:', err);
+      this.notifyStatus('connecting', 'Host is offline or away. Waiting for host to reconnect...');
+      this.scheduleClientReconnect(hostPeerId);
+    }
   }
 
-  private attemptClientReconnect(hostPeerId: string) {
-    if (this.isDestroyed) return;
-    setTimeout(() => {
+  private scheduleClientReconnect(hostPeerId: string, delayMs = 2500) {
+    if (this.isDestroyed || this.isHost) return;
+    if (this.clientReconnectTimer) return;
+
+    this.clientReconnectTimer = setTimeout(() => {
+      this.clientReconnectTimer = null;
+      if (this.isDestroyed || this.isHost) return;
       if (this.peer && !this.peer.destroyed) {
-        this.connectToHost(hostPeerId, () => {}, () => {});
+        this.connectToHost(hostPeerId);
       }
-    }, 2500);
+    }, delayMs);
   }
 
   private handleIncomingClient(conn: any) {
@@ -831,6 +866,10 @@ export class PeerGameManager {
     if (this.trickTransitionTimer) clearTimeout(this.trickTransitionTimer);
     if (this.inactivityInterval) clearInterval(this.inactivityInterval);
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    if (this.clientReconnectTimer) {
+      clearTimeout(this.clientReconnectTimer);
+      this.clientReconnectTimer = null;
+    }
     if (typeof window !== 'undefined' && this.unloadHandler) {
       window.removeEventListener('beforeunload', this.unloadHandler);
       window.removeEventListener('pagehide', this.unloadHandler);
